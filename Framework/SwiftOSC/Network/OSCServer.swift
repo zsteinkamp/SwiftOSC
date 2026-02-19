@@ -111,9 +111,8 @@ public class OSCServer {
                     os_log("Server '%{Public}@' failed to create listener: %{Public}@", log: SwiftOSCLog, type: .error, self.name ?? "<noName>", error.localizedDescription)
                 }
                 /// wait a little with restart to reduce load
-                // TODO: store timer and cancel on next call!
-                _ = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { _ in
-                    self.restart()
+                _ = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
+                    self?.restart()
                 }
             case .cancelled:
                 os_log("Server '%{Public}@': Listener cancelled.", log: SwiftOSCLog, type: .default, self.name ?? "<noName>")
@@ -316,10 +315,10 @@ public class OSCServer {
     
     /// cancel connection and listener
     public func stop() {
-//        connection?.forceCancel()
         connection?.cancel()
+        connection = nil
         listener?.cancel()
-        // listener = nil
+        listener = nil
     }
     
     /// cancel conection and listener, then start with refreshed settings
