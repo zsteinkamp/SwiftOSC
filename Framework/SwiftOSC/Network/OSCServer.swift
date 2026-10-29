@@ -22,6 +22,10 @@ public class OSCServer {
     public var connection: NWConnection?
     /// When this flag is set, the server uses delegate method didReceive(_:port:) instead of didReceive(_:)
     public private(set) var indicatesPort: Bool
+
+    /// POSIX receive socket (bound to INADDR_ANY) and its read source. See setupListener().
+    private var socketFD: Int32 = -1
+    private var readSource: DispatchSourceRead?
     
     // TODO: why does init have to be failing?
     public init?(port: UInt16, bonjourName: String? = nil, delegate: OSCDelegate? = nil, domain: String? = nil, indicatesPort: Bool = false) {
@@ -40,104 +44,75 @@ public class OSCServer {
     }
     
     private func setupListener() {
-        
-        /// listener parameters
-        let udpOption = NWProtocolUDP.Options()
-        let params = NWParameters(dtls: nil, udp: udpOption)
-        params.allowLocalEndpointReuse = true
-        params.serviceClass = .signaling // TODO: compare to standard '.best-effort', faster communication?
-        
-        /// create the listener
-        do {
-            listener = try NWListener(using: params, on: port)
-        } catch let error {
-            os_log("Server failed to create listener: %{Public}@", log: SwiftOSCLog, type: .error, error.localizedDescription)
-        }
-        
-        /// Bonjour service
-        if self.name != nil {
-            listener?.service = NWListener.Service(name: name,
-                                                   type: "_osc._udp",
-                                                   domain: domain)
-//            listener?.service?.noAutoRename
-        }
-        
-        /// handle incoming connections server will only connect to the latest connection
-        listener?.newConnectionHandler = { [weak self] (newConnection) in
-            guard let self else { return }
-            
-            os_log("Server '%{Public}@': New connection %{Public}@", log: SwiftOSCLog, type: .default, self.name ?? "<noName>", newConnection.debugDescription)
 
-            // TODO: check if new connection port is TotalMix
-            // if endpoint type: case hostPort(host: NWEndpoint.Host, port: NWEndpoint.Port)
-            // query port in Terminal:
-            // lsof -i -P | grep -i "UDP localhost:64194"
-            // check if returns containing "TotalmixF"
+        // Receive OSC on a plain POSIX UDP socket bound to INADDR_ANY, instead
+        // of Network.framework's NWListener. NWListener does not surface UDP
+        // datagrams that arrive on a secondary interface such as a USB-C
+        // CDC-NCM link: the handshake reply reaches the device over the cable
+        // but the app never sees it (verified by on-cable tcpdump, 2026-10-28).
+        // A socket bound to 0.0.0.0 accepts datagrams on EVERY interface
+        // unconditionally, so it works over Wi-Fi exactly as before AND over
+        // the USB link. (This server never advertises Bonjour -- the app only
+        // browses -- so NWListener's service feature was unused here anyway.)
+        let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        if fd < 0 {
+            os_log("Server '%{Public}@': failed to create socket, errno %{Public}@", log: SwiftOSCLog, type: .error, self.name ?? "<noName>", String(errno))
+            return
+        }
 
-//            switch newConnection {
-//            case .init(host: let newRemoteHost, port: let newRemotePort, using: _):
-//                print("newRemoteHost:Port: \(newRemoteHost):\(newRemotePort)")
-//            case .init(to: _, using: _):
-//                break
-//            default:
-//                break
-//            }
-            
-            /// Cancel previous connection
-            if self.connection != nil {
-                os_log("Server '%{Public}@': Cancelling previous connection %{Public}@", log: SwiftOSCLog, type: .default, self.name ?? "<noName>", connection.debugDescription)
-                self.connection?.cancel()
+        var reuse: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &reuse, socklen_t(MemoryLayout<Int32>.size))
+
+        // Non-blocking so the read handler can drain every queued datagram per
+        // fire (the meter stream is high-rate) without ever blocking the queue.
+        let flags = fcntl(fd, F_GETFL, 0)
+        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_addr.s_addr = 0 // INADDR_ANY -- all interfaces
+        addr.sin_port = port.rawValue.bigEndian
+
+        let bindResult = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
-            
-            /// Start new connection
-            self.connection = newConnection
-            self.connection?.start(queue: self.queue)
-            self.receive()
         }
-        
-        /// Handle listener state changes
-        listener?.stateUpdateHandler = { [weak self] newState in
-            guard let self else { return }
-            
-            switch newState {
-            case .ready:
-                os_log("Server '%{Public}@': Ready, listening on port %{Public}@, delegate: %{Public}@, indicatesPort: %{Public}@", log: SwiftOSCLog, type: .default, self.name ?? "<noName>", String(describing: self.listener?.port ?? 0), delegateDescription(), self.indicatesPort.description)
-            case .failed(let error):
-                // there are .dns() and .tls() cases, too
-                // [48: Address already in use]
-                if case let .posix(errorNumber) = error {
-                    os_log("Server '%{Public}@': Listener failed with: %{Public}@: %{Public}@", log: SwiftOSCLog, type: .error, self.name ?? "<noName>", String(describing: errorNumber), error.localizedDescription)
+        if bindResult < 0 {
+            os_log("Server '%{Public}@': failed to bind port %{Public}@, errno %{Public}@", log: SwiftOSCLog, type: .error, self.name ?? "<noName>", String(describing: self.port), String(errno))
+            close(fd)
+            return
+        }
+
+        self.socketFD = fd
+
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        source.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            var buffer = [UInt8](repeating: 0, count: 65536)
+            while true {
+                let n = buffer.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, 0) }
+                if n > 0 {
+                    self.decodePacket(Data(buffer[0..<Int(n)]))
                 } else {
-                    os_log("Server '%{Public}@' failed to create listener: %{Public}@", log: SwiftOSCLog, type: .error, self.name ?? "<noName>", error.localizedDescription)
+                    break
                 }
-                /// wait a little with restart to reduce load
-                _ = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
-                    self?.restart()
-                }
-            case .cancelled:
-                os_log("Server '%{Public}@': Listener cancelled.", log: SwiftOSCLog, type: .default, self.name ?? "<noName>")
-            default:
-                break
             }
         }
-        
-        /// start the listener
-        listener?.start(queue: queue)
+        source.setCancelHandler {
+            close(fd)
+        }
+        self.readSource = source
+        source.resume()
+
+        os_log("Server '%{Public}@': Ready, listening on UDP port %{Public}@ (POSIX, all interfaces), delegate: %{Public}@", log: SwiftOSCLog, type: .default, self.name ?? "<noName>", String(describing: self.port), delegateDescription())
     }
     
-    /// receive
-    public func receive() {
-        connection?.receiveMessage { [weak self] (content, context, isCompleted, error) in
-            if let data = content {
-                // data.printHexString()
-                self?.decodePacket(data)
-            }
-            
-            if error == nil && self?.connection != nil{
-                self?.receive()
-            }
-        }
-    }
+    /// No-op. Reads are driven by the POSIX DispatchSource created in
+    /// setupListener(); kept for API compatibility.
+    public func receive() {}
     
     func decodePacket(_ data: Data){
         
@@ -313,8 +288,11 @@ public class OSCServer {
         }
     }
     
-    /// cancel connection and listener
+    /// cancel the receive socket (and any legacy NWListener/connection)
     public func stop() {
+        readSource?.cancel()
+        readSource = nil
+        socketFD = -1
         connection?.cancel()
         connection = nil
         listener?.cancel()
